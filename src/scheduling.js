@@ -81,13 +81,146 @@ function halfOpenOverlap(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
 }
 
+// ---------- 联排共享资源：半开时段占用扫描 ----------
+
+/**
+ * 按半开时段 [start, end) 扫描每个共享资源的占用，返回所有「占用 > 容量」的连续时段。
+ * resources: [{id, name, capacity}]（空数组 / 空入参时返回空——旧版没有资源数据沿用原有行为）
+ * intervalsByCue: Map(cueId -> {code, start, end, status?, usages: [{resourceId, usage}]})
+ *   跳过项不应放入 Map（调用方负责）；时段按调用方给出的实际 / 预计 / 顺延后执行时段。
+ * 返回 [{resourceId, resource, capacity, start, end, startText, endText, used, over,
+ *        cues: [{cueRef, code, usage}], key}]
+ * 相邻的超额半开时段若涉及的提示项集合完全相同则合并为一段（占用量相同，必然连续）。
+ */
+function scanResourceWindows(resources, intervalsByCue) {
+  const windows = [];
+  if (!Array.isArray(resources) || !resources.length || !intervalsByCue) return windows;
+
+  // 资源 id -> 容量/名称 + 参与提示项列表 [{cueRef, code, start, end, usage}]
+  const byResource = new Map(resources.map((r) => [r.id, {
+    id: r.id, name: r.name, capacity: r.capacity, items: [],
+  }]));
+  for (const [cueId, iv] of intervalsByCue.entries()) {
+    if (!iv || iv.start === null || iv.end === null || iv.end <= iv.start) continue;
+    for (const u of (iv.usages || [])) {
+      if (!u || !(u.usage > 0)) continue;
+      const res = byResource.get(u.resourceId);
+      if (!res) continue; // 失效资源引用忽略（写入路径会拦截；此处容错）
+      res.items.push({ cueRef: cueId, code: iv.code, start: iv.start, end: iv.end, usage: u.usage, status: iv.status });
+    }
+  }
+
+  for (const res of byResource.values()) {
+    if (!res.items.length) continue;
+    // 事件点扫描：占用量只在某提示项开始/结束时变化
+    const points = [...new Set(res.items.flatMap((it) => [it.start, it.end]))].sort((a, b) => a - b);
+    let open = null;
+    for (let i = 0; i + 1 < points.length; i++) {
+      const s = points[i];
+      const e = points[i + 1];
+      // 半开 [s,e)：项的开始严格小于格子结束，且项的结束不早于格子结束（[start,end) 覆盖整个格子）
+      const active = res.items.filter((it) => it.start < e && it.end >= e);
+      const used = active.reduce((n, it) => n + it.usage, 0);
+      const activeRefs = active.map((it) => it.cueRef).sort((a, b) => a - b);
+      const key = `${res.id}#${activeRefs.join(',')}`;
+      if (used > res.capacity) {
+        if (open && open.key === key && open.end === s) {
+          open.end = e; // 同一组提示项的相邻超额时段合并
+        } else {
+          if (open) windows.push(open);
+          open = {
+            resourceId: res.id, resource: res.name, capacity: res.capacity,
+            start: s, end: e, used, over: used - res.capacity, key,
+            cues: active.map((it) => ({ cueRef: it.cueRef, code: it.code, usage: it.usage, status: it.status }))
+              .sort((a, b) => a.cueRef - b.cueRef),
+          };
+        }
+      } else if (open) {
+        windows.push(open);
+        open = null;
+      }
+    }
+    if (open) windows.push(open);
+  }
+
+  return windows
+    .map((w) => ({ ...w, startText: minToTime(w.start), endText: minToTime(w.end) }))
+    .sort((a, b) => a.resourceId - b.resourceId || a.start - b.start);
+}
+
+function resourceWindowMessage(w) {
+  return `共享资源「${w.resource}」容量 ${w.capacity} 在 ${w.startText}-${w.endText} 被占用 ${w.used}（超额 ${w.over}），相关提示项：${w.cues
+    .map((c) => `「${c.code}」占 ${c.usage}`).join('、')}`;
+}
+
+/**
+ * 现场共享资源超额告警（口径与现场重算一致）：
+ * 跳过项不占用；仅由已完成项构成的超额不告警（至少一个相关提示项为未完成/已开始才告警）。
+ * 告警只提示，不阻止登记。
+ * liveCues: computeLive 的 cues（含 status / schedStart / schedEnd）
+ * resourceUsages: Map(cueRef -> [{resourceId, usage}])
+ * 返回 [{resourceId, resource, capacity, startText, endText, used, over, key, message, cues}]
+ */
+function liveResourceAlerts(resources, liveCues, resourceUsages) {
+  if (!Array.isArray(resources) || !resources.length || !resourceUsages) return [];
+  const intervals = new Map();
+  for (const c of liveCues) {
+    if (c.status === 'SKIPPED') continue; // 跳过项不占用
+    const usages = (resourceUsages.get(c.id) || []).filter((u) => u.usage > 0);
+    if (!usages.length) continue;
+    // 已完成：实际执行时段；已开始：实际开始 → 顺延推算/预计结束；未开始：顺延后待执行时段
+    intervals.set(c.id, { code: c.code, start: c.schedStart, end: c.schedEnd, status: c.status, usages });
+  }
+  return scanResourceWindows(resources, intervals)
+    .filter((w) => w.cues.some((c) => c.status !== 'DONE')) // 仅有已完成项的超额不告警
+    .map((w) => ({
+      resourceId: w.resourceId, resource: w.resource, capacity: w.capacity,
+      start: w.start, end: w.end, startText: w.startText, endText: w.endText,
+      used: w.used, over: w.over, key: w.key,
+      cues: w.cues.map((c) => ({ cueRef: c.cueRef, code: c.code, usage: c.usage, status: c.status })),
+      message: resourceWindowMessage(w),
+    }));
+}
+
+/**
+ * 共享资源告警对照（顺延预演）：按「资源 + 相关提示项集合」为稳定键，
+ * 区分新增（🔴）/ 消失（🟢）/ 持续（🟠，持续项给变更前后两条消息）。口径与现场一致。
+ */
+function diffResourceAlerts(baselineAlerts, scenarioAlerts) {
+  const added = [];
+  const removed = [];
+  const kept = [];
+  for (const sc of scenarioAlerts) {
+    const bc = (baselineAlerts || []).find((b) => b.key === sc.key && b.resourceId === sc.resourceId);
+    if (!bc) added.push(sc);
+    else kept.push({ baseline: bc, scenario: sc });
+  }
+  for (const bc of baselineAlerts || []) {
+    if (!(scenarioAlerts || []).some((s) => s.key === bc.key && s.resourceId === bc.resourceId)) removed.push(bc);
+  }
+  return {
+    resourceAlertsAdded: added,
+    resourceAlertsRemoved: removed,
+    resourceAlertsKept: kept,
+    summary: {
+      baselineResourceAlertCount: (baselineAlerts || []).length,
+      scenarioResourceAlertCount: (scenarioAlerts || []).length,
+      resourceAddedCount: added.length,
+      resourceRemovedCount: removed.length,
+      resourceKeptCount: kept.length,
+    },
+  };
+}
+
 /**
  * 发布前计划校验。
  * cues: [{id, code, position, plannedStart, duration}]
  * deps: [{from, to}]
+ * resources: [{id, name, capacity}]（联排共享资源；可为空——旧版/无资源数据时不校验）
+ * resourceUsages: Map(cueId -> [{resourceId, usage}])，按提示项的计划半开时段累计
  * 返回 { ok, errors: [{ type, message, codes: [] }] }
  */
-function validatePlan(cues, deps) {
+function validatePlan(cues, deps, resources, resourceUsages) {
   const errors = [];
   const byId = new Map(cues.map((c) => [c.id, c]));
 
@@ -154,6 +287,29 @@ function validatePlan(cues, deps) {
           `岗位「${position}」时段冲突：「${a.code}」(${minToTime(a.plannedStart)}-${minToTime(a.plannedStart + a.duration)}) 与「${b.code}」(${minToTime(b.plannedStart)}-${minToTime(b.plannedStart + b.duration)})`)
         .join('；'),
     });
+  }
+
+  // 4) 共享资源：按计划半开时段累计同一资源占用，超出容量时列明资源、超额时段与相关提示项
+  if (Array.isArray(resources) && resources.length && resourceUsages) {
+    const planIntervals = new Map();
+    for (const c of cues) {
+      const us = (resourceUsages.get(c.id) || []).filter((u) => u.usage > 0);
+      if (us.length) planIntervals.set(c.id, { code: c.code, start: c.plannedStart, end: c.plannedStart + c.duration, usages: us });
+    }
+    for (const w of scanResourceWindows(resources, planIntervals)) {
+      errors.push({
+        type: 'RESOURCE_OVERLOAD',
+        resource: w.resource,
+        capacity: w.capacity,
+        startText: w.startText,
+        endText: w.endText,
+        used: w.used,
+        over: w.over,
+        codes: w.cues.map((c) => c.code),
+        message: `共享资源「${w.resource}」容量 ${w.capacity} 在 ${w.startText}-${w.endText} 被占用 ${w.used}（超额 ${w.over}），相关提示项：${w.cues
+          .map((c) => `「${c.code}」占 ${c.usage}`).join('、')}`,
+      });
+    }
   }
 
   return { ok: errors.length === 0, errors };
@@ -508,12 +664,16 @@ const WHATIF_STATUS_LABEL = { PENDING: '未开始', RUNNING: '已开始', DONE: 
  * 入参与 computeLive 相同，另含：
  *   assumptions: [{cueRef, estimatedEnd}]（已解析为分钟数；允许把未开始项既有预计结束改为更早，
  *                只要不早于预演出的开始；重算不早于原计划等规则完全沿用 computeLive）
+ *   resources / resourceUsages: 发布时冻结的共享资源与提示项占用；传入时一并给出资源告警的
+ *                新增 / 消失 / 持续对照（口径与现场 liveResourceAlerts 一致）；旧版无资源数据时可省略
  *
  * 返回：
  *   { errors: [{cueRef, code, reason}] }  存在无效假设时调用方应整体拒绝（不产出任何结果）
- *   或 { baseline, scenario, cues, conflictsAdded, conflictsRemoved, conflictsKept, summary }
+ *   或 { baseline, scenario, cues, conflictsAdded, conflictsRemoved, conflictsKept, summary,
+ *        baselineResourceAlerts, scenarioResourceAlerts, resourceAlertsAdded,
+ *        resourceAlertsRemoved, resourceAlertsKept }
  */
-function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions) {
+function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions, resources, resourceUsages) {
   const baseline = computeLive(publishedCues, deps, regMap, interruptions);
   if (baseline.orderProblem) return { orderProblem: baseline.orderProblem };
 
@@ -584,6 +744,11 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions)
     if (!scenConflicts.has(key)) conflictsRemoved.push(bc);
   }
 
+  // 共享资源告警对照（口径与现场一致：跳过项不占用，仅已完成项构成的超额不告警）
+  const baselineResourceAlerts = liveResourceAlerts(resources || [], baseline.cues, resourceUsages || new Map());
+  const scenarioResourceAlerts = liveResourceAlerts(resources || [], scenario.cues, resourceUsages || new Map());
+  const resourceDiff = diffResourceAlerts(baselineResourceAlerts, scenarioResourceAlerts);
+
   const assumedSet = new Set(assumptions.map((a) => a.cueRef));
   const cues = scenario.cues
     .slice()
@@ -623,6 +788,11 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions)
     conflictsAdded,
     conflictsRemoved,
     conflictsKept,
+    baselineResourceAlerts,
+    scenarioResourceAlerts,
+    resourceAlertsAdded: resourceDiff.resourceAlertsAdded,
+    resourceAlertsRemoved: resourceDiff.resourceAlertsRemoved,
+    resourceAlertsKept: resourceDiff.resourceAlertsKept,
     summary: {
       cueCount: cues.length,
       assumedCount: assumptions.length,
@@ -632,6 +802,7 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions)
       addedCount: conflictsAdded.length,
       removedCount: conflictsRemoved.length,
       keptCount: conflictsKept.length,
+      ...resourceDiff.summary,
     },
   };
 }
@@ -789,4 +960,5 @@ function computeReview(publishedCues, deps, regMap, interruptions) {
 module.exports = {
   timeToMin, minToTime, topoAnalyze, validatePlan, computeLive, explainSchedule, simulateWhatIf,
   computeReview, runningEndShift, interruptionHoldMinute,
+  scanResourceWindows, liveResourceAlerts, diffResourceAlerts,
 };

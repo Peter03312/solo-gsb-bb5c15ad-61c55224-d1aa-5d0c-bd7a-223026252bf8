@@ -49,6 +49,21 @@ CREATE TABLE IF NOT EXISTS draft_deps (
   UNIQUE(from_cue, to_cue)
 );
 
+-- 联排共享资源（舞监在草稿中配置）：名称 + 正整数容量；仍被提示项引用时禁止删除
+CREATE TABLE IF NOT EXISTS draft_resources (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  name      TEXT NOT NULL UNIQUE,
+  capacity  INTEGER NOT NULL CHECK (capacity > 0)
+);
+
+-- 提示项对共享资源的正整数占用量（草稿）；删除提示项时级联清除
+CREATE TABLE IF NOT EXISTS draft_cue_resources (
+  cue_id       INTEGER NOT NULL REFERENCES draft_cues(id) ON DELETE CASCADE,
+  resource_id  INTEGER NOT NULL REFERENCES draft_resources(id),
+  usage        INTEGER NOT NULL CHECK (usage > 0),
+  PRIMARY KEY (cue_id, resource_id)
+);
+
 -- 已发布的只读联排版本
 CREATE TABLE IF NOT EXISTS rehearsal_versions (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,6 +91,24 @@ CREATE TABLE IF NOT EXISTS published_deps (
   from_ref    INTEGER NOT NULL,
   to_ref      INTEGER NOT NULL,
   UNIQUE(version_id, from_ref, to_ref)
+);
+
+-- 发布时冻结的共享资源（容量随版本冻结；草稿后续修改不影响旧版）
+CREATE TABLE IF NOT EXISTS published_resources (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id  INTEGER NOT NULL REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  resource_id INTEGER NOT NULL,          -- 发布时的草稿资源 id
+  name        TEXT NOT NULL,
+  capacity    INTEGER NOT NULL
+);
+
+-- 发布时冻结的提示项资源占用
+CREATE TABLE IF NOT EXISTS published_cue_resources (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id  INTEGER NOT NULL REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  cue_ref     INTEGER NOT NULL,
+  resource_id INTEGER NOT NULL,          -- 对应草稿资源 id（与 published_resources.resource_id 一致）
+  usage       INTEGER NOT NULL
 );
 
 -- 现场登记（每个已发布提示项一行，随发布创建）
@@ -191,6 +224,8 @@ CREATE TABLE IF NOT EXISTS release_signoff_preds (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pcues_version ON published_cues(version_id);
+CREATE INDEX IF NOT EXISTS idx_pres_version ON published_resources(version_id);
+CREATE INDEX IF NOT EXISTS idx_pcr_version ON published_cue_resources(version_id);
 CREATE INDEX IF NOT EXISTS idx_reg_version ON registrations(version_id);
 CREATE INDEX IF NOT EXISTS idx_corr_version ON registration_corrections(version_id);
 CREATE INDEX IF NOT EXISTS idx_deputies_version ON position_deputies(version_id);

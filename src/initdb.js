@@ -14,6 +14,22 @@ const DEFAULT_USERS = [
 
 const SEED_POSITIONS = ['灯光', '音响', '道具'];
 
+// 示例共享资源（容量为正整数）；占用按各提示项计划半开时段累计，配置后示例草稿仍可直接发布
+const SEED_RESOURCES = [
+  { name: '无线麦', capacity: 2 },
+  { name: '升降台', capacity: 1 },
+];
+
+// 提示项 -> [{资源名, 占用量}]
+const SEED_CUE_RESOURCES = {
+  L1: [{ resource: '无线麦', usage: 1 }],
+  S1: [{ resource: '无线麦', usage: 1 }],
+  S2: [{ resource: '无线麦', usage: 1 }],
+  L2: [{ resource: '无线麦', usage: 1 }],
+  L3: [{ resource: '无线麦', usage: 1 }, { resource: '升降台', usage: 1 }],
+  P1: [{ resource: '升降台', usage: 1 }],
+};
+
 // 可直接发布的示例联排计划（依赖关系满足顺序，同岗位互不重叠）
 const SEED_CUES = [
   { code: 'L1', title: '开场灯光就位', position: '灯光', start: '19:00', duration: 5 },
@@ -56,6 +72,12 @@ function seedDraft() {
   const insertDep = db.prepare(
     'INSERT INTO draft_deps(from_cue, to_cue) VALUES (?, ?)'
   );
+  const insertResource = db.prepare(
+    'INSERT INTO draft_resources(name, capacity) VALUES (?, ?)'
+  );
+  const insertCueResource = db.prepare(
+    'INSERT INTO draft_cue_resources(cue_id, resource_id, usage) VALUES (?, ?, ?)'
+  );
 
   const tx = db.transaction((cues) => {
     const codeToId = new Map();
@@ -72,6 +94,16 @@ function seedDraft() {
     for (const c of cues) {
       for (const pre of c.deps || []) {
         insertDep.run(codeToId.get(pre), codeToId.get(c.code));
+      }
+    }
+    const resNameToId = new Map();
+    for (const r of SEED_RESOURCES) {
+      const info = insertResource.run(r.name, r.capacity);
+      resNameToId.set(r.name, info.lastInsertRowid);
+    }
+    for (const [code, usages] of Object.entries(SEED_CUE_RESOURCES)) {
+      for (const u of usages) {
+        insertCueResource.run(codeToId.get(code), resNameToId.get(u.resource), u.usage);
       }
     }
   });
