@@ -203,17 +203,87 @@ function loadDraftDeps() {
     .map((d) => ({ id: d.id, from: d.from_cue, to: d.to_cue }));
 }
 
+// 草稿共享资源：[{id, name, capacity}]
+function loadDraftResources() {
+  return db.prepare('SELECT id, name, capacity FROM draft_resources ORDER BY id').all()
+    .map((r) => ({ id: r.id, name: r.name, capacity: r.capacity }));
+}
+
+// 草稿提示项资源占用：Map(cueId -> [{resourceId, resourceName, quantity}])
+function loadDraftUsages() {
+  const rows = db.prepare(
+    `SELECT u.cue_id, u.resource_id, u.quantity, r.name AS resource_name
+     FROM draft_resource_usages u JOIN draft_resources r ON r.id = u.resource_id
+     ORDER BY u.cue_id, u.resource_id`
+  ).all();
+  const map = new Map();
+  for (const u of rows) {
+    if (!map.has(u.cue_id)) map.set(u.cue_id, []);
+    map.get(u.cue_id).push({ resourceId: u.resource_id, resourceName: u.resource_name, quantity: u.quantity });
+  }
+  return map;
+}
+
+// 校验用：Map(cueId -> [{resourceId, quantity}])
+function draftUsageQuantities(usageMap) {
+  const q = new Map();
+  for (const [cueId, list] of usageMap.entries()) {
+    q.set(cueId, list.map((u) => ({ resourceId: u.resourceId, quantity: u.quantity })));
+  }
+  return q;
+}
+
 function draftPayload() {
   const cues = loadDraftCues();
   const deps = loadDraftDeps();
-  const validation = validatePlan(cues, deps);
+  const resources = loadDraftResources();
+  const usageMap = loadDraftUsages();
+  const validation = validatePlan(cues, deps, resources, draftUsageQuantities(usageMap));
   return {
     version: Number(getMeta('draft_version', '0')),
     positions: positionsList(),
-    cues: cues.map((c) => ({ ...c, plannedStartText: minToTime(c.plannedStart) })),
+    cues: cues.map((c) => ({
+      ...c,
+      plannedStartText: minToTime(c.plannedStart),
+      resources: usageMap.get(c.id) || [],
+    })),
     deps,
+    resources,
     validation,
   };
+}
+
+// 解析提示项请求体中的资源占用：resources: [{id|resourceId, quantity}]
+// 返回 [{resourceId, quantity}]；quantity 为空/0 视为不占用；无效数量或失效资源引用抛 BAD_INPUT（整体拒绝）
+function parseCueResources(body, resourcesMap) {
+  if (!Object.prototype.hasOwnProperty.call(body, 'resources')) return null; // 未传字段：不改变既有占用
+  const raw = body.resources;
+  if (!Array.isArray(raw)) throw new ApiError(400, 'BAD_INPUT', '资源占用应为数组 [{id, quantity}]');
+  const out = [];
+  const seen = new Set();
+  for (const it of raw) {
+    const rid = Number(it?.id ?? it?.resourceId);
+    if (!Number.isInteger(rid)) throw new ApiError(400, 'BAD_INPUT', '资源占用每项须包含整数资源 id（资源引用可能已失效，请刷新后重试）');
+    if (seen.has(rid)) throw new ApiError(400, 'BAD_INPUT', `同一共享资源（id ${rid}）的占用重复提交`);
+    seen.add(rid);
+    if (!resourcesMap.has(rid)) {
+      throw new ApiError(400, 'BAD_INPUT', `引用的共享资源（id ${rid}）不存在或已删除，资源引用失效，请刷新后重试`);
+    }
+    if (it.quantity === '' || it.quantity === null || it.quantity === undefined) continue; // 留空=不占用
+    const q = Number(it.quantity);
+    if (!Number.isInteger(q) || q <= 0) {
+      throw new ApiError(400, 'BAD_INPUT', `共享资源「${resourcesMap.get(rid).name}」的占用量必须为正整数（留空表示不占用）`);
+    }
+    out.push({ resourceId: rid, quantity: q });
+  }
+  return out;
+}
+
+// 替换某草稿提示项的全部资源占用（调用方须在事务内）
+function replaceCueUsages(cueId, usages) {
+  db.prepare('DELETE FROM draft_resource_usages WHERE cue_id = ?').run(cueId);
+  const ins = db.prepare('INSERT INTO draft_resource_usages(cue_id, resource_id, quantity) VALUES (?, ?, ?)');
+  for (const u of usages) ins.run(cueId, u.resourceId, u.quantity);
 }
 
 function cueInputFromBody(body) {
@@ -275,7 +345,24 @@ function versionInputs(versionId) {
     resumedBy: it.resumed_by,
     resumedAt: it.resumed_at,
   }));
-  return { cues, deps, regMap, interruptions };
+  // 共享资源（发布冻结）：旧版没有资源数据时为空数组，computeLive 等沿用旧行为
+  const resources = db.prepare(
+    'SELECT resource_ref, name, capacity FROM published_resources WHERE version_id = ? ORDER BY id'
+  ).all(versionId).map((r) => ({ id: r.resource_ref, name: r.name, capacity: r.capacity }));
+  const usages = db.prepare(
+    'SELECT cue_ref, resource_ref, quantity FROM published_resource_usages WHERE version_id = ? ORDER BY id'
+  ).all(versionId);
+  const resByName = new Map(resources.map((r) => [r.id, r.name]));
+  const usagesByCue = new Map();
+  for (const u of usages) {
+    if (!usagesByCue.has(u.cue_ref)) usagesByCue.set(u.cue_ref, []);
+    usagesByCue.get(u.cue_ref).push({
+      resourceId: u.resource_ref,
+      resourceName: resByName.get(u.resource_ref) ?? `#${u.resource_ref}`,
+      quantity: u.quantity,
+    });
+  }
+  return { cues, deps, regMap, interruptions, resources, usagesByCue };
 }
 
 // 当前进行中的停排（同版至多一段；无则 null）
@@ -379,7 +466,7 @@ function releaseViewOf(records) {
 }
 
 function versionPayload(versionRow) {
-  const { cues, deps, regMap, interruptions } = versionInputs(versionRow.id);
+  const { cues, deps, regMap, interruptions, resources, usagesByCue } = versionInputs(versionRow.id);
 
   // 依赖链跳过留痕（每项至多一条）：操作者、时间、原因、触发根项
   const skipMap = new Map();
@@ -393,7 +480,10 @@ function versionPayload(versionRow) {
     skippedAt: s.skipped_at,
   }));
 
-  const live = computeLive(cues, deps, regMap, interruptions);
+  const live = computeLive(cues, deps, regMap, interruptions,
+    resources,
+    new Map([...usagesByCue].map(([ref, list]) =>
+      [ref, list.map((u) => ({ resourceId: u.resourceId, quantity: u.quantity }))])));
   const latestId = (db.prepare('SELECT MAX(version_no) AS m FROM rehearsal_versions').get().m);
 
   // 放行签认：cue_ref -> 该提示项全部签认记录（含已失效，按 id 升序）
@@ -483,8 +573,13 @@ function versionPayload(versionRow) {
       release: c.needsRelease
         ? releaseViewOf(signoffMap.get(c.id) || [])
         : { required: false },
+      // 共享资源占用（发布冻结；无资源的旧版为空数组，前端不展示）
+      resources: usagesByCue.get(c.id) || [],
     })),
     conflicts: live.conflicts,
+    // 共享资源：发布冻结的资源清单与按现场口径重算的超额告警（跳过项不占用；仅已完成项超额不告警）
+    resources,
+    resourceAlerts: live.resourceAlerts,
     orderProblem: live.orderProblem,
     // 联排中断：全部停排记录（含已恢复，留痕回看）与当前进行中的停排（无则 null）
     interruptions: interruptions.map(interruptionJson),
@@ -526,7 +621,10 @@ app.get('/api/draft', requireSM, (req, res, next) => {
 });
 
 app.get('/api/draft/validate', requireSM, (req, res, next) => {
-  try { res.json(validatePlan(loadDraftCues(), loadDraftDeps())); } catch (e) { next(e); }
+  try {
+    res.json(validatePlan(loadDraftCues(), loadDraftDeps(), loadDraftResources(),
+      draftUsageQuantities(loadDraftUsages())));
+  } catch (e) { next(e); }
 });
 
 app.post('/api/draft/cues', requireSM, (req, res, next) => {
@@ -535,10 +633,15 @@ app.post('/api/draft/cues', requireSM, (req, res, next) => {
     const fields = cueInputFromBody(req.body);
     const dup = db.prepare('SELECT 1 FROM draft_cues WHERE code = ?').get(fields.code);
     if (dup) throw new ApiError(400, 'BAD_INPUT', `编号「${fields.code}」已存在`);
-    db.prepare(
-      `INSERT INTO draft_cues(code, title, position, planned_start, duration, needs_release)
-       VALUES (@code, @title, @position, @plannedStart, @duration, @needsRelease)`
-    ).run(fields);
+    const resourcesMap = new Map(loadDraftResources().map((r) => [r.id, r]));
+    const usages = parseCueResources(req.body, resourcesMap) || [];
+    db.transaction(() => {
+      const info = db.prepare(
+        `INSERT INTO draft_cues(code, title, position, planned_start, duration, needs_release)
+         VALUES (@code, @title, @position, @plannedStart, @duration, @needsRelease)`
+      ).run(fields);
+      replaceCueUsages(info.lastInsertRowid, usages);
+    })();
     bumpDraftVersion();
     res.status(201).json(draftPayload());
   } catch (e) { next(e); }
@@ -558,11 +661,17 @@ app.put('/api/draft/cues/:id', requireSM, (req, res, next) => {
     const fields = cueInputFromBody(req.body);
     const dup = db.prepare('SELECT 1 FROM draft_cues WHERE code = ? AND id != ?').get(fields.code, id);
     if (dup) throw new ApiError(400, 'BAD_INPUT', `编号「${fields.code}」已存在`);
-    db.prepare(
-      `UPDATE draft_cues SET code=@code, title=@title, position=@position,
-         planned_start=@plannedStart, duration=@duration, needs_release=@needsRelease,
-         row_ver=row_ver+1 WHERE id=@id`
-    ).run({ ...fields, id });
+    const resourcesMap = new Map(loadDraftResources().map((r) => [r.id, r]));
+    const usages = parseCueResources(req.body, resourcesMap);
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE draft_cues SET code=@code, title=@title, position=@position,
+           planned_start=@plannedStart, duration=@duration, needs_release=@needsRelease,
+           row_ver=row_ver+1 WHERE id=@id`
+      ).run({ ...fields, id });
+      // 未传 resources 字段时保留既有占用；传入（含空数组）则整体替换
+      if (usages !== null) replaceCueUsages(id, usages);
+    })();
     bumpDraftVersion();
     res.json(draftPayload());
   } catch (e) { next(e); }
@@ -603,6 +712,78 @@ app.delete('/api/draft/deps/:id', requireSM, (req, res, next) => {
     const id = Number(req.params.id);
     const info = db.prepare('DELETE FROM draft_deps WHERE id = ?').run(id);
     if (info.changes === 0) throw new ApiError(404, 'NOT_FOUND', '前置关系不存在');
+    bumpDraftVersion();
+    res.json(draftPayload());
+  } catch (e) { next(e); }
+});
+
+// ---------- 舞监：联排共享资源（草稿配置：名称 + 正整数容量） ----------
+
+function resourceInputFromBody(body) {
+  const name = String(body.name || '').trim();
+  const capacity = Number(body.capacity);
+  if (!name) throw new ApiError(400, 'BAD_INPUT', '共享资源名称不能为空');
+  if (name.length > 50) throw new ApiError(400, 'BAD_INPUT', '共享资源名称不能超过 50 字');
+  if (!Number.isInteger(capacity) || capacity <= 0) {
+    throw new ApiError(400, 'BAD_INPUT', '共享资源容量必须为正整数');
+  }
+  return { name, capacity };
+}
+
+app.get('/api/draft/resources', requireSM, (req, res, next) => {
+  try {
+    res.json({ version: Number(getMeta('draft_version', '0')), resources: loadDraftResources() });
+  } catch (e) { next(e); }
+});
+
+app.post('/api/draft/resources', requireSM, (req, res, next) => {
+  try {
+    checkDraftVersion(req.body.version);
+    const { name, capacity } = resourceInputFromBody(req.body);
+    if (db.prepare('SELECT 1 FROM draft_resources WHERE name = ?').get(name)) {
+      throw new ApiError(400, 'BAD_INPUT', `共享资源「${name}」已存在`);
+    }
+    db.prepare('INSERT INTO draft_resources(name, capacity) VALUES (?, ?)').run(name, capacity);
+    bumpDraftVersion();
+    res.status(201).json(draftPayload());
+  } catch (e) { next(e); }
+});
+
+app.put('/api/draft/resources/:id', requireSM, (req, res, next) => {
+  try {
+    checkDraftVersion(req.body.version);
+    const id = Number(req.params.id);
+    const resRow = db.prepare('SELECT * FROM draft_resources WHERE id = ?').get(id);
+    if (!resRow) throw new ApiError(404, 'NOT_FOUND', '共享资源不存在');
+    const { name, capacity } = resourceInputFromBody(req.body);
+    const dup = db.prepare('SELECT 1 FROM draft_resources WHERE name = ? AND id != ?').get(name, id);
+    if (dup) throw new ApiError(400, 'BAD_INPUT', `共享资源「${name}」已存在`);
+    db.prepare('UPDATE draft_resources SET name = ?, capacity = ? WHERE id = ?').run(name, capacity, id);
+    bumpDraftVersion();
+    res.json(draftPayload());
+  } catch (e) { next(e); }
+});
+
+// 仍被提示项引用（存在正整数占用）的资源不能删除：逐项列明引用后整体拒绝
+app.delete('/api/draft/resources/:id', requireSM, (req, res, next) => {
+  try {
+    checkDraftVersion(Number(req.query.version));
+    const id = Number(req.params.id);
+    const resRow = db.prepare('SELECT * FROM draft_resources WHERE id = ?').get(id);
+    if (!resRow) throw new ApiError(404, 'NOT_FOUND', '共享资源不存在');
+    const refs = db.prepare(
+      `SELECT c.id AS cue_id, c.code, u.quantity
+       FROM draft_resource_usages u JOIN draft_cues c ON c.id = u.cue_id
+       WHERE u.resource_id = ? ORDER BY c.id`
+    ).all(id);
+    if (refs.length) {
+      throw new ApiError(409, 'RESOURCE_IN_USE',
+        `共享资源「${resRow.name}」仍被 ${refs.length} 个提示项引用，不能删除；请先清除这些提示项的占用量`,
+        { resourceId: id, resourceName: resRow.name,
+          items: refs.map((r) => ({ cueId: r.cue_id, code: r.code, quantity: r.quantity,
+            reason: `「${r.code}」仍占用 ${r.quantity}` })) });
+    }
+    db.prepare('DELETE FROM draft_resources WHERE id = ?').run(id);
     bumpDraftVersion();
     res.json(draftPayload());
   } catch (e) { next(e); }
@@ -804,7 +985,9 @@ app.post('/api/publish', requireSM, (req, res, next) => {
 
       const cues = loadDraftCues();
       const deps = loadDraftDeps();
-      const validation = validatePlan(cues, deps);
+      const draftResources = loadDraftResources();
+      const draftUsageMap = loadDraftUsages();
+      const validation = validatePlan(cues, deps, draftResources, draftUsageQuantities(draftUsageMap));
 
       // 交接：确认发布时重新核对草稿版本、旧执行版及所选登记行版本，任一变化或资格失效整体拒绝
       // cueRef -> { actualStart, actualEnd }，仅用于发布时写入延续登记
@@ -906,6 +1089,13 @@ app.post('/api/publish', requireSM, (req, res, next) => {
       const insDep = db.prepare(
         'INSERT INTO published_deps(version_id, from_ref, to_ref) VALUES (?, ?, ?)'
       );
+      // 共享资源：发布时冻结资源名称、容量与各提示项占用量（后续草稿修改不影响本版）
+      const insResource = db.prepare(
+        'INSERT INTO published_resources(version_id, resource_ref, name, capacity) VALUES (?, ?, ?, ?)'
+      );
+      const insUsage = db.prepare(
+        'INSERT INTO published_resource_usages(version_id, cue_ref, resource_ref, quantity) VALUES (?, ?, ?, ?)'
+      );
       // 未选择交接的提示项保持空登记；所选项仅带入实际开始、实际完成，并标明来源版本与提示项
       const insReg = db.prepare(
         `INSERT INTO registrations(version_id, cue_ref, position, actual_start, actual_end, source_version_id, source_cue_ref)
@@ -913,6 +1103,10 @@ app.post('/api/publish', requireSM, (req, res, next) => {
       );
       for (const c of cues) insCue.run(versionId, c.id, c.code, c.title, c.position, c.plannedStart, c.duration, c.needsRelease ? 1 : 0);
       for (const d of deps) insDep.run(versionId, d.from, d.to);
+      for (const r of draftResources) insResource.run(versionId, r.id, r.name, r.capacity);
+      for (const [cueId, list] of draftUsageMap.entries()) {
+        for (const u of list) insUsage.run(versionId, cueId, u.resourceId, u.quantity);
+      }
       for (const c of cues) {
         const h = carry.get(c.id);
         insReg.run({
@@ -997,12 +1191,15 @@ app.get('/api/versions/:id/cues/:cueRef/explain', requireAuth, (req, res, next) 
     const pc = db.prepare('SELECT 1 FROM published_cues WHERE version_id = ? AND cue_ref = ?').get(ver.id, cueRef);
     if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
 
-    const { cues, deps, regMap, interruptions } = versionInputs(ver.id);
+    const { cues, deps, regMap, interruptions, resources, usagesByCue } = versionInputs(ver.id);
     const skipReasons = new Map();
     db.prepare('SELECT cue_ref, reason FROM registration_skips WHERE version_id = ?')
       .all(ver.id).forEach((s) => skipReasons.set(s.cue_ref, s.reason));
 
-    const explain = explainSchedule(cues, deps, regMap, cueRef, skipReasons, interruptions);
+    const explain = explainSchedule(cues, deps, regMap, cueRef, skipReasons, interruptions,
+      resources,
+      new Map([...usagesByCue].map(([ref, list]) =>
+        [ref, list.map((u) => ({ resourceId: u.resourceId, quantity: u.quantity }))])));
     if (explain.notFound) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
     const latestNo = db.prepare('SELECT MAX(version_no) AS m FROM rehearsal_versions').get().m;
     res.json({
@@ -1837,9 +2034,11 @@ app.post('/api/live/whatif', requireSM, (req, res, next) => {
           { currentVersionId: latest.id, currentVersionNo: latest.version_no });
       }
 
-      const { cues, deps, regMap, interruptions } = versionInputs(ver.id);
+      const { cues, deps, regMap, interruptions, resources, usagesByCue } = versionInputs(ver.id);
       const cueById = new Map(cues.map((c) => [c.id, c]));
       const readAt = new Date().toLocaleString('sv-SE');
+      const usageQ = new Map([...usagesByCue].map(([ref, list]) =>
+        [ref, list.map((u) => ({ resourceId: u.resourceId, quantity: u.quantity }))]));
 
       // rows 必须与当前版本全部提示项一一对应；任一登记行版本变化整体拒绝
       const stale = [];
@@ -1878,8 +2077,8 @@ app.post('/api/live/whatif', requireSM, (req, res, next) => {
           { items: stale, currentVersionId: latest.id, currentVersionNo: latest.version_no });
       }
 
-      // 以同一快照为基线一次性套用全部假设并重算（联排中断顺延规则一致）
-      const sim = simulateWhatIf(cues, deps, regMap, assumptionsParsed, interruptions);
+      // 以同一快照为基线一次性套用全部假设并重算（联排中断顺延与共享资源口径一致）
+      const sim = simulateWhatIf(cues, deps, regMap, assumptionsParsed, interruptions, resources, usageQ);
       if (sim.orderProblem) {
         throw new ApiError(409, 'WHATIF_ORDER_PROBLEM', `已发布数据检测到依赖环，无法预演：${sim.orderProblem}`);
       }
@@ -1888,10 +2087,10 @@ app.post('/api/live/whatif', requireSM, (req, res, next) => {
           `${sim.errors.length} 项假设不成立，本次预演已整体拒绝（未更改任何登记、计划与更正历史）`,
           { items: sim.errors });
       }
-      return { ver, sim, readAt };
+      return { ver, sim, readAt, resources };
     })();
 
-    const { ver, sim, readAt } = result;
+    const { ver, sim, readAt, resources } = result;
     res.json({
       versionId: ver.id,
       versionNo: ver.version_no,
@@ -1904,11 +2103,17 @@ app.post('/api/live/whatif', requireSM, (req, res, next) => {
         estimatedEndText: a.estimatedEndText,
       })),
       cues: sim.cues,
+      resources,
       baselineConflicts: sim.baseline.conflicts,
       scenarioConflicts: sim.scenario.conflicts,
       conflictsAdded: sim.conflictsAdded,
       conflictsRemoved: sim.conflictsRemoved,
       conflictsKept: sim.conflictsKept,
+      baselineResourceAlerts: sim.baseline.resourceAlerts,
+      scenarioResourceAlerts: sim.scenario.resourceAlerts,
+      resourceAlertsAdded: sim.resourceAlertsAdded,
+      resourceAlertsRemoved: sim.resourceAlertsRemoved,
+      resourceAlertsKept: sim.resourceAlertsKept,
       summary: sim.summary,
     });
   } catch (e) { next(e); }

@@ -49,6 +49,22 @@ CREATE TABLE IF NOT EXISTS draft_deps (
   UNIQUE(from_cue, to_cue)
 );
 
+-- 联排共享资源（草稿配置）：舞监为联排配置跨岗位共享的资源名称与正整数容量
+CREATE TABLE IF NOT EXISTS draft_resources (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  name      TEXT NOT NULL UNIQUE,
+  capacity  INTEGER NOT NULL            -- 正整数：同一半开时段内允许的并发占用上限
+);
+
+-- 提示项对共享资源的正整数占用量（草稿；每提示项每资源至多一条，留空即不占用）
+CREATE TABLE IF NOT EXISTS draft_resource_usages (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  cue_id       INTEGER NOT NULL REFERENCES draft_cues(id) ON DELETE CASCADE,
+  resource_id  INTEGER NOT NULL REFERENCES draft_resources(id),
+  quantity     INTEGER NOT NULL,        -- 正整数占用量
+  UNIQUE(cue_id, resource_id)
+);
+
 -- 已发布的只读联排版本
 CREATE TABLE IF NOT EXISTS rehearsal_versions (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,6 +93,27 @@ CREATE TABLE IF NOT EXISTS published_deps (
   to_ref      INTEGER NOT NULL,
   UNIQUE(version_id, from_ref, to_ref)
 );
+
+-- 联排共享资源（发布冻结）：发布时把草稿资源名称与容量原样复制，后续草稿修改不影响旧版
+CREATE TABLE IF NOT EXISTS published_resources (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id   INTEGER NOT NULL REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  resource_ref INTEGER NOT NULL,         -- 指向当时的 draft resource id
+  name         TEXT NOT NULL,
+  capacity     INTEGER NOT NULL,
+  UNIQUE(version_id, resource_ref)
+);
+
+-- 提示项对共享资源的正整数占用量（发布冻结）
+CREATE TABLE IF NOT EXISTS published_resource_usages (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id    INTEGER NOT NULL REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  cue_ref       INTEGER NOT NULL,
+  resource_ref  INTEGER NOT NULL,
+  quantity      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pres_usage_version ON published_resource_usages(version_id);
+CREATE INDEX IF NOT EXISTS idx_pres_version ON published_resources(version_id);
 
 -- 现场登记（每个已发布提示项一行，随发布创建）
 CREATE TABLE IF NOT EXISTS registrations (

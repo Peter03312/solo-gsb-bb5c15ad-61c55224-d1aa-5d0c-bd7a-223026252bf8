@@ -82,12 +82,98 @@ function halfOpenOverlap(aStart, aEnd, bStart, bEnd) {
 }
 
 /**
+ * 共享资源超额计算（草稿计划与现场重算共用同一口径，半开时段 [start, end)）。
+ *
+ * resources: [{id, name, capacity}]
+ * usagesByCue: Map(cueId -> [{resourceId, quantity}])（仅正整数占用；跳过项不应传入）
+ * cueIntervals: [{cue:{id,code}, start, end, status?}]（半开执行时段；跳过项不传）
+ *   status 仅现场重算有值（PENDING/RUNNING/DONE）；草稿计划不传（视为计划项）。
+ * options.suppressAllDone: 现场口径——某超额时段内的占用项全部为已完成（DONE）时不告警；
+ *   草稿口径（默认 false）一律告警。
+ *
+ * 按事件扫描法求每个资源占用量发生变化的最小半开时段，超过容量的相邻同集合同量时段合并；
+ * 每段返回 {resourceId, resourceName, capacity, usage, over, startText, endText, cues:[{cueRef,code,quantity,status}]}。
+ */
+function computeResourceAlerts(resources, usagesByCue, cueIntervals, options = {}) {
+  const suppressAllDone = options.suppressAllDone === true;
+  const alerts = [];
+  for (const res of resources || []) {
+    const events = new Map(); // 分钟 -> Map(cueId -> {delta, quantity})
+    for (const iv of cueIntervals) {
+      const usages = usagesByCue.get(iv.cue.id) || [];
+      const u = usages.find((x) => x.resourceId === res.id);
+      if (!u || !(u.quantity > 0) || !(iv.end > iv.start)) continue;
+      if (!events.has(iv.start)) events.set(iv.start, new Map());
+      if (!events.has(iv.end)) events.set(iv.end, new Map());
+      events.get(iv.start).set(iv.cue.id, { delta: 1, quantity: u.quantity, cue: iv.cue, status: iv.status || null });
+      events.get(iv.end).set(iv.cue.id, { delta: -1 });
+    }
+    if (!events.size) continue;
+    const times = [...events.keys()].sort((a, b) => a - b);
+    const active = new Map(); // cueId -> {quantity, cue, status}
+    const raw = [];
+    for (let i = 0; i < times.length - 1; i++) {
+      const t = times[i];
+      for (const [cueId, e] of events.get(t)) {
+        if (e.delta > 0) active.set(cueId, { quantity: e.quantity, cue: e.cue, status: e.status });
+        else active.delete(cueId);
+      }
+      const start = times[i];
+      const end = times[i + 1];
+      if (end <= start || active.size === 0) continue;
+      let usage = 0;
+      for (const a of active.values()) usage += a.quantity;
+      if (usage <= res.capacity) continue;
+      // 现场口径：仅有已完成项（全部 DONE）的超额时段不告警
+      if (suppressAllDone && [...active.values()].every((a) => a.status === 'DONE')) continue;
+      const cues = [...active.entries()]
+        .map(([cueId, a]) => ({ cueRef: cueId, code: a.cue.code, quantity: a.quantity, status: a.status }))
+        .sort((a, b) => a.cueRef - b.cueRef);
+      raw.push({ start, end, usage, cues });
+    }
+    // 合并相邻（半开首尾相接）、占用量与占用项集合完全相同的时段
+    const merged = [];
+    for (const seg of raw) {
+      const last = merged[merged.length - 1];
+      if (last && last.end === seg.start && last.usage === seg.usage
+          && last.cues.length === seg.cues.length
+          && last.cues.every((c, i) => c.cueRef === seg.cues[i].cueRef && c.quantity === seg.cues[i].quantity
+                                       && c.status === seg.cues[i].status)) {
+        last.end = seg.end;
+      } else {
+        merged.push({ ...seg });
+      }
+    }
+    for (const seg of merged) {
+      alerts.push({
+        resourceId: res.id,
+        resourceName: res.name,
+        capacity: res.capacity,
+        usage: seg.usage,
+        over: seg.usage - res.capacity,
+        startMinute: seg.start,
+        endMinute: seg.end,
+        startText: minToTime(seg.start),
+        endText: minToTime(seg.end),
+        cues: seg.cues,
+        message: `共享资源「${res.name}」在 ${minToTime(seg.start)}-${minToTime(seg.end)} 超额：占用 ${seg.usage} > 容量 ${res.capacity}（超 ${seg.usage - res.capacity}）；相关提示项：${seg.cues.map((c) => `「${c.code}」占 ${c.quantity}`).join('、')}`,
+      });
+    }
+  }
+  alerts.sort((a, b) =>
+    (a.resourceId - b.resourceId) || (a.startMinute - b.startMinute) || (a.endMinute - b.endMinute));
+  return alerts;
+}
+
+/**
  * 发布前计划校验。
  * cues: [{id, code, position, plannedStart, duration}]
  * deps: [{from, to}]
+ * resources: [{id, name, capacity}]（草稿配置的共享资源）
+ * usagesByCue: Map(cueId -> [{resourceId, quantity}])（各提示项正整数占用量）
  * 返回 { ok, errors: [{ type, message, codes: [] }] }
  */
-function validatePlan(cues, deps) {
+function validatePlan(cues, deps, resources, usagesByCue) {
   const errors = [];
   const byId = new Map(cues.map((c) => [c.id, c]));
 
@@ -156,6 +242,24 @@ function validatePlan(cues, deps) {
     });
   }
 
+  // 4) 共享资源：按计划半开时段累计同一资源占用，超过容量时列明资源、超额时段和相关提示项
+  if (resources && resources.length && usagesByCue && usagesByCue.size) {
+    const intervals = cues.map((c) => ({
+      cue: { id: c.id, code: c.code },
+      start: c.plannedStart,
+      end: c.plannedStart + c.duration,
+    }));
+    const resAlerts = computeResourceAlerts(resources, usagesByCue, intervals);
+    if (resAlerts.length) {
+      errors.push({
+        type: 'RESOURCE_OVERUSE',
+        codes: [...new Set(resAlerts.flatMap((a) => a.cues.map((c) => c.code)))],
+        resourceAlerts: resAlerts,
+        message: resAlerts.map((a) => a.message).join('；'),
+      });
+    }
+  }
+
   return { ok: errors.length === 0, errors };
 }
 
@@ -194,16 +298,19 @@ function interruptionHoldMinute(segments) {
  * deps: [{from, to}]（以 cueRef 表示）
  * regs: Map/object keyed by cueRef -> {actualStart, actualEnd, estimatedEnd, skipped, rowVer, updatedBy, updatedAt}
  * interruptions: [{pauseMinute, resumeMinute(null=进行中)}]，联排停排记录
+ * resources: [{id, name, capacity}]（发布冻结的共享资源；旧版无资源数据时为空数组，沿用旧行为）
+ * usagesByCue: Map(cueRef -> [{resourceId, quantity}])（发布冻结的正整数占用量）
  *
  * 舞监标记为跳过的项：状态 SKIPPED，不产生待执行时段，不参与前置顺延与岗位冲突，
  * 其他项仍按现有前置与登记规则重算。
+ * 共享资源超额与现场重算同口径：跳过项不占用；仅有已完成项的超额时段不告警；告警不阻止登记。
  * 联排中断规则：
  * - 实际登记时间（实际开始/完成）永不改变；已完成项不做顺延；
  * - 已开始未完成项：按时长推算结束与停排前填写的预计结束顺延中断重叠分钟，且不得早于最近恢复时刻；
  * - 未开始项：重算开始不得早于最近恢复时刻（停排中为本次停排时刻）；其预计结束已在停排时清除。
- * 返回 { cues: [...], conflicts: [{position,a,b,message}], orderProblem: null|message }
+ * 返回 { cues: [...], conflicts: [...], resourceAlerts: [...], orderProblem: null|message }
  */
-function computeLive(publishedCues, deps, regMap, interruptions) {
+function computeLive(publishedCues, deps, regMap, interruptions, resources, usagesByCue) {
   const segments = interruptions || [];
   const { holdMinute, activePauseMinute } = interruptionHoldMinute(segments);
   const byId = new Map(publishedCues.map((c) => [c.id, c]));
@@ -220,7 +327,7 @@ function computeLive(publishedCues, deps, regMap, interruptions) {
 
   const calc = new Map();
   if (!order) {
-    return { cues: [], conflicts: [], orderProblem: '已发布数据检测到依赖环，无法重算' };
+    return { cues: [], conflicts: [], resourceAlerts: [], orderProblem: '已发布数据检测到依赖环，无法重算' };
   }
 
   // 联排中断：将「时刻 + 顺延规则」应用到已开始项与未开始项
@@ -328,7 +435,17 @@ function computeLive(publishedCues, deps, regMap, interruptions) {
 
   // 按计划开始时间返回，便于现场阅读
   const cues = [...calc.values()].sort((a, b) => a.plannedStart - b.plannedStart || a.id - b.id);
-  return { cues, conflicts, orderProblem: null };
+
+  // 共享资源超额（与现场口径一致：跳过项不占用；仅有已完成项的超额时段不告警）
+  let resourceAlerts = [];
+  if (resources && resources.length && usagesByCue && usagesByCue.size) {
+    const resIntervals = cues
+      .filter((c) => c.status !== 'SKIPPED' && c.schedStart !== null && c.schedEnd !== null && c.schedEnd > c.schedStart)
+      .map((c) => ({ cue: { id: c.id, code: c.code }, start: c.schedStart, end: c.schedEnd, status: c.status }));
+    resourceAlerts = computeResourceAlerts(resources, usagesByCue, resIntervals, { suppressAllDone: true });
+  }
+
+  return { cues, conflicts, resourceAlerts, orderProblem: null };
 }
 
 const EXPLAIN_STATUS_LABEL = { PENDING: '未开始', RUNNING: '已开始', DONE: '已完成', SKIPPED: '已跳过' };
@@ -345,8 +462,8 @@ const EXPLAIN_STATUS_LABEL = { PENDING: '未开始', RUNNING: '已开始', DONE:
  * publishedCues / deps / regMap 与 computeLive 入参相同；
  * cueRef 为目标提示项引用；skipReasons 可选 Map(cueRef -> 跳过原因)，仅用于展示。
  */
-function explainSchedule(publishedCues, deps, regMap, cueRef, skipReasons, interruptions) {
-  const live = computeLive(publishedCues, deps, regMap, interruptions);
+function explainSchedule(publishedCues, deps, regMap, cueRef, skipReasons, interruptions, resources, usagesByCue) {
+  const live = computeLive(publishedCues, deps, regMap, interruptions, resources, usagesByCue);
   if (live.orderProblem) {
     return { applicable: false, reason: `已发布数据检测到依赖环，无法重算：${live.orderProblem}` };
   }
@@ -511,10 +628,11 @@ const WHATIF_STATUS_LABEL = { PENDING: '未开始', RUNNING: '已开始', DONE: 
  *
  * 返回：
  *   { errors: [{cueRef, code, reason}] }  存在无效假设时调用方应整体拒绝（不产出任何结果）
- *   或 { baseline, scenario, cues, conflictsAdded, conflictsRemoved, conflictsKept, summary }
+ *   或 { baseline, scenario, cues, conflictsAdded, conflictsRemoved, conflictsKept,
+ *        resourceAlertsAdded, resourceAlertsRemoved, resourceAlertsKept, resourceSummary }
  */
-function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions) {
-  const baseline = computeLive(publishedCues, deps, regMap, interruptions);
+function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions, resources, usagesByCue) {
+  const baseline = computeLive(publishedCues, deps, regMap, interruptions, resources, usagesByCue);
   if (baseline.orderProblem) return { orderProblem: baseline.orderProblem };
 
   // 预演登记：一次性套用全部假设（只改预计结束；不动实际开始/完成、跳过状态与计划）
@@ -525,8 +643,8 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions)
     if (r) whatReg.set(a.cueRef, { ...r, estimatedEnd: a.estimatedEnd });
   }
 
-  // 全部假设同时生效后的重算结果（联排中断顺延规则保持一致）
-  const scenario = computeLive(publishedCues, deps, whatReg, interruptions);
+  // 全部假设同时生效后的重算结果（联排中断顺延与共享资源口径保持一致）
+  const scenario = computeLive(publishedCues, deps, whatReg, interruptions, resources, usagesByCue);
 
   const baseByRef = new Map(baseline.cues.map((c) => [c.id, c]));
   const scenByRef = new Map(scenario.cues.map((c) => [c.id, c]));
@@ -584,6 +702,24 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions)
     if (!scenConflicts.has(key)) conflictsRemoved.push(bc);
   }
 
+  // 共享资源超额对照（口径与现场一致）：以「资源 + 半开时段 + 占用项集合」为稳定键，
+  // 区分新增 / 消失 / 持续；持续项时段或占用量变化时同时给出变更前后消息。
+  const resAlertKey = (a) =>
+    `${a.resourceId}|${a.startMinute}-${a.endMinute}|${a.cues.map((c) => c.cueRef).sort((x, y) => x - y).join('#')}`;
+  const baseResAlerts = new Map(baseline.resourceAlerts.map((a) => [resAlertKey(a), a]));
+  const scenResAlerts = new Map(scenario.resourceAlerts.map((a) => [resAlertKey(a), a]));
+  const resourceAlertsAdded = [];
+  const resourceAlertsRemoved = [];
+  const resourceAlertsKept = [];
+  for (const [key, sa] of scenResAlerts) {
+    const ba = baseResAlerts.get(key);
+    if (!ba) resourceAlertsAdded.push(sa);
+    else resourceAlertsKept.push({ baseline: ba, scenario: sa });
+  }
+  for (const [key, ba] of baseResAlerts) {
+    if (!scenResAlerts.has(key)) resourceAlertsRemoved.push(ba);
+  }
+
   const assumedSet = new Set(assumptions.map((a) => a.cueRef));
   const cues = scenario.cues
     .slice()
@@ -623,6 +759,9 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions)
     conflictsAdded,
     conflictsRemoved,
     conflictsKept,
+    resourceAlertsAdded,
+    resourceAlertsRemoved,
+    resourceAlertsKept,
     summary: {
       cueCount: cues.length,
       assumedCount: assumptions.length,
@@ -632,6 +771,11 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions)
       addedCount: conflictsAdded.length,
       removedCount: conflictsRemoved.length,
       keptCount: conflictsKept.length,
+      baselineResourceAlertCount: baseline.resourceAlerts.length,
+      scenarioResourceAlertCount: scenario.resourceAlerts.length,
+      resourceAddedCount: resourceAlertsAdded.length,
+      resourceRemovedCount: resourceAlertsRemoved.length,
+      resourceKeptCount: resourceAlertsKept.length,
     },
   };
 }
@@ -787,6 +931,7 @@ function computeReview(publishedCues, deps, regMap, interruptions) {
 }
 
 module.exports = {
-  timeToMin, minToTime, topoAnalyze, validatePlan, computeLive, explainSchedule, simulateWhatIf,
+  timeToMin, minToTime, topoAnalyze, validatePlan, computeResourceAlerts, computeLive,
+  explainSchedule, simulateWhatIf,
   computeReview, runningEndShift, interruptionHoldMinute,
 };

@@ -46,6 +46,29 @@
 
         <div id="validation-panel" class="panel"></div>
 
+        <div class="panel" id="resource-panel">
+          <h3>联排共享资源</h3>
+          <p class="muted">
+            配置跨岗位共享的资源（如升降台、无线话筒）：<strong>名称</strong>与<strong>正整数容量</strong>（同一半开时段允许的并发占用上限）。
+            在下方提示项表单中为每个提示项填写各资源的<strong>正整数占用量</strong>（留空表示不占用）；
+            校验会按计划半开时段累计同一资源占用，超过容量时阻止发布。<strong>仍被提示项引用的资源不能删除</strong>。
+            资源容量与占用量在发布时冻结，后续草稿修改不影响已发布版本。
+          </p>
+          <form id="resource-form" class="resource-form">
+            <input type="hidden" name="id" />
+            <label>资源名称 <input name="name" maxlength="50" required placeholder="如：升降台" /></label>
+            <label>容量（正整数） <input name="capacity" type="number" min="1" step="1" required /></label>
+            <button type="submit" class="primary" id="resource-submit">新增资源</button>
+            <button type="button" class="ghost" id="resource-cancel" hidden>取消编辑</button>
+          </form>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>名称</th><th>容量</th><th>被引用</th><th>操作</th></tr></thead>
+              <tbody id="draft-resource-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
         <div class="grid2">
           <div class="panel">
             <h3 id="cue-form-title">新增提示项</h3>
@@ -64,6 +87,7 @@
                 <label>时长(分钟) <input name="duration" type="number" min="1" step="1" required /></label>
               </div>
               <label class="release-check"><input type="checkbox" name="needsRelease" /> 需放行（须执行人「签认就绪」+ 舞监「签认可执行」齐备后才能登记实际开始；标记随发布冻结）</label>
+              <div id="cue-resources-box" class="cue-resources-box"></div>
               <div class="form-actions">
                 <button type="submit" class="primary" id="cue-submit">新增</button>
                 <button type="button" id="cue-cancel" class="ghost" hidden>取消编辑</button>
@@ -88,7 +112,7 @@
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>编号</th><th>说明</th><th>岗位</th><th>计划开始</th><th>时长</th><th>计划结束</th><th>需放行</th><th>前置</th><th>操作</th></tr>
+                <tr><th>编号</th><th>说明</th><th>岗位</th><th>计划开始</th><th>时长</th><th>计划结束</th><th>需放行</th><th>共享资源占用</th><th>前置</th><th>操作</th></tr>
               </thead>
               <tbody id="draft-cue-tbody"></tbody>
             </table>
@@ -127,7 +151,12 @@
         <div id="live-meta" class="panel"></div>
         <div id="live-interruption-banner"></div>
         <div id="live-conflicts"></div>
+        <div id="live-resource-alerts"></div>
         <div id="live-deputy-banner"></div>
+        <div class="panel" id="live-resources-panel" hidden>
+          <h3>本版共享资源（发布冻结 · 只读）</h3>
+          <div id="live-resources-body"></div>
+        </div>
         <div class="panel" id="interruption-panel" hidden>
           <h3>联排中断：停排 / 恢复（仅当前执行版）</h3>
           <p class="muted">
@@ -183,7 +212,7 @@
             <table>
               <thead>
                 <tr>
-                  <th>编号</th><th>说明</th><th>岗位</th><th>计划</th>
+                  <th>编号</th><th>说明</th><th>岗位</th><th>共享资源</th><th>计划</th>
                   <th>重算开始</th><th>重算结束</th><th>状态</th><th>放行签认</th><th>实际开始</th><th>实际完成</th><th>预计结束</th><th id="live-col-reg">岗位登记</th>
                 </tr>
               </thead>

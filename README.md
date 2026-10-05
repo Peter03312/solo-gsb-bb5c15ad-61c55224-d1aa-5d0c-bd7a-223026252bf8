@@ -1,6 +1,6 @@
 # 联排提示板（Rehearsal CueBoard）
 
-为剧场联排制作的 Web 提示板：舞监（Stage Manager）在草稿中录入提示项的计划开始时间、时长、负责岗位与前置关系，校验通过后发布**只读联排版本**；灯光 / 音响 / 道具等执行岗位在现场页面只登记**本岗位**提示项的实际开始、完成或预计结束时间，系统依据前置项的实际/预计结束自动重算未开始项，并展示顺延导致的岗位冲突。
+为剧场联排制作的 Web 提示板：舞监（Stage Manager）在草稿中录入提示项的计划开始时间、时长、负责岗位与前置关系，并配置跨岗位**共享资源**（名称与正整数容量）及各提示项的正整数占用量；校验通过后发布**只读联排版本**（资源容量与占用同时冻结）；灯光 / 音响 / 道具等执行岗位在现场页面只登记**本岗位**提示项的实际开始、完成或预计结束时间，系统依据前置项的实际/预计结束自动重算未开始项，并展示顺延导致的岗位冲突与共享资源超额（跳过项不占用、仅已完成项超额不告警、告警不阻止登记）。
 
 - 后端：Node.js + Express + better-sqlite3（SQLite，同步事务）
 - 前端：浏览器原生 HTML/CSS/JavaScript（无需构建）
@@ -74,9 +74,10 @@ npm start
 3. 页面实时显示校验结果。满足以下全部条件时才可发布：
    - 每个前置项的**计划结束 ≤ 后项计划开始**；
    - **同一岗位**的计划时段不重叠（首尾相接允许）；
+   - **共享资源**按计划半开时段累计的同一资源占用不超过容量（超额时列明资源、时段与相关提示项）；
    - 前置依赖**无环**；
-   - 失败时明确列出每一项冲突（冲突双方、岗位、时间、环路径）；
-4. 点击「发布联排版本」生成只读版本，现场随即以该版本为准；草稿可继续修改并发布新版本。
+   - 失败时明确列出每一项冲突（冲突双方、岗位、时间、环路径、资源超额时段）；
+4. 点击「发布联排版本」生成只读版本，现场随即以该版本为准（资源名称、容量与占用随版冻结，后续草稿改动不影响旧版）；草稿可继续修改并发布新版本。
 
 #### 发布新版前：旧执行版已完成登记交接（本轮新增）
 
@@ -160,6 +161,23 @@ npm start
 - **已跳过前置不构成约束**（单独标注，含跳过原因）；**原计划本身决定开始**时明确显示「无需顺延」（前置结束恰与原计划同刻到达时也会注明）；
 - 解释与**同一版本的现场重算结果一致**：登记、更正或跳过后刷新页面即可看到最新解释；历史版本按归档状态**只读回看**；
 - 目标为**已开始 / 已完成 / 已跳过**项时给出明确说明（无待解释的排期开始）；目标或版本不存在时返回 404；查询为只读，**不改动登记与已发布计划**。
+
+### 联排共享资源（跨岗位容量校验）
+
+舞监在草稿编辑页的「**联排共享资源**」面板配置联排期间跨岗位共用的资源（如升降台、无线话筒），并在提示项表单中填写每项对各资源的占用量：
+
+1. **草稿配置**：资源包含**名称**与**正整数容量**（同一半开时段允许的并发占用上限）；提示项可为每个资源填写**正整数占用量**（留空表示不占用）。名称不能为空、同草稿内唯一，容量与占用量必须为正整数，否则对应请求（无效数量、失效资源引用、过期草稿版本）**整体拒绝**（400 `BAD_INPUT` / 409 `VERSION_CONFLICT`）；
+2. **仍被引用的资源不能删除**：删除时若还有提示项占用该资源，返回 409 `RESOURCE_IN_USE`，响应逐项列出引用提示项及其占用量；请先清除占用再删除；
+3. **草稿校验按计划半开时段累计同一资源的占用**（首尾相接不算重叠）：任一资源占用超过容量即校验不通过，错误（`RESOURCE_OVERUSE`）**列明资源、超额时段和相关提示项**（各自占用量），并与既有计划校验一样**阻止发布**（422 `PUBLISH_CONFLICT`）；
+4. **发布时冻结**：资源名称、容量与各提示项占用量随版本整体冻结到发布版（`published_resources` / `published_resource_usages`）；之后再改草稿的资源名称、容量或占用**不影响任何旧版**；**旧版没有资源数据时完全沿用原有行为**（资源列表为空、不产生任何超额告警）；
+5. **现场按实际、预计与顺延后的执行时段重算资源超额**，口径与岗位顺延完全一致：
+   - **跳过项不占用**资源（也不参与累计）；
+   - 超额时段内**仅有已完成项**（占用项全部为已完成）时**不告警**；存在未开始 / 已开始项即告警；
+   - 告警只展示在现场页蓝色「共享资源超额」横幅（列明资源、半开时段、占用/容量与各项状态），**不阻止岗位登记**；
+   - 登记、舞监更正、跳过、停排 / 恢复后随重算结果自动刷新；历史版本回看页同样展示该版冻结的资源清单与按当前登记重算的超额告警（只读）；
+6. **顺延预演中的资源告警**：预演结果在同岗位冲突之外，另给出共享资源超额的**🔴 新增、🟢 消失、🟠 持续**对照（稳定键为「资源 + 半开时段 + 占用提示项集合」；持续项时段变化时同时给出变更前后消息），口径与现场完全一致（跳过项不占用、仅已完成项不告警），顶部汇总「基线 N 项 → 预演 M 项」。
+
+接口：`GET /api/draft/resources`、`POST/PUT/DELETE /api/draft/resources[/:id]`（DELETE 见上述 409）；提示项增改请求体可带 `resources: [{id, quantity}]`（空数量表示不占用；未传该字段时保留原占用）。草稿与发布负载含顶层 `resources`，每个提示项含 `resources: [{resourceId, resourceName, quantity}]`；现场 / 版本负载另含顶层 `resourceAlerts`；预演响应含 `resourceAlertsAdded/Removed/Kept` 与汇总字段。示例见第十六节。
 
 ### 联排中断：停排 / 恢复（本轮新增）
 
@@ -293,11 +311,12 @@ SESSION_SECRET=your-long-random-secret
 | POST | `/api/login` `/api/logout` | 公开 | 登录 / 退出 |
 | GET | `/api/me` | 公开 | 当前会话与岗位列表 |
 | GET | `/api/draft` | 舞监 | 草稿（含实时校验结果） |
-| POST/PUT/DELETE | `/api/draft/cues[/:id]` | 舞监 | 提示项增改删（校验草稿版本号/行版本号） |
+| POST/PUT/DELETE | `/api/draft/cues[/:id]` | 舞监 | 提示项增改删（校验草稿版本号/行版本号；请求体可带 `resources:[{id,quantity}]` 配置共享资源正整数占用量，留空=不占用，未传=保留原值；无效数量或失效资源引用 400 `BAD_INPUT` 整体拒绝） |
 | POST/DELETE | `/api/draft/deps[/:id]` | 舞监 | 前置关系增删（校验草稿版本号） |
+| GET/POST/PUT/DELETE | `/api/draft/resources[/:id]` | 舞监 | **联排共享资源**：查询 / 新增 / 改名改容量 / 删除（名称唯一、容量正整数；仍被提示项引用时删除返回 409 `RESOURCE_IN_USE`，逐项列出引用与占用量）；各接口校验草稿版本号 |
 | GET | `/api/publish/handover/preview` | 舞监 | **发布前交接预览**：旧执行版已完成项的交接资格、不合格原因、旧登记行版本；无旧版时列表为空 |
-| POST | `/api/publish` | 舞监 | 发布只读版本；冲突返回 422 并列出冲突项；可带 `handover` 交接选择，资格/版本失效返回 409 `HANDOVER_STALE`；**当前执行版停排中须先恢复，否则 409 `INTERRUPTION_ACTIVE`** |
-| GET | `/api/live` | 已登录 | 当前最新版本的现场重算结果（含每行更正历史 `corrections`、跳过留痕 `skip`、放行签认 `release`、本版代班记录 `deputies`、**联排中断记录 `interruptions` 与 `activeInterruption`，及每行中断影响 `interrupted/pauseShiftMinutes/pauseHoldText`**；执行账号另含有效岗位 `myPositions`） |
+| POST | `/api/publish` | 舞监 | 发布只读版本；冲突返回 422 并列出冲突项（含 **`RESOURCE_OVERUSE` 共享资源超额**：资源、超额时段、相关提示项）；可带 `handover` 交接选择，资格/版本失效返回 409 `HANDOVER_STALE`；**当前执行版停排中须先恢复，否则 409 `INTERRUPTION_ACTIVE`**；发布同时冻结共享资源容量与占用 |
+| GET | `/api/live` | 已登录 | 当前最新版本的现场重算结果（含每行更正历史 `corrections`、跳过留痕 `skip`、放行签认 `release`、本版代班记录 `deputies`、**冻结共享资源 `resources` 与每行占用 `cues[].resources`、现场口径重算的超额告警 `resourceAlerts`（跳过项不占用；仅已完成项超额不告警；仅提示不阻止登记）**、**联排中断记录 `interruptions` 与 `activeInterruption`，及每行中断影响 `interrupted/pauseShiftMinutes/pauseHoldText`**；执行账号另含有效岗位 `myPositions`） |
 | GET | `/api/live/deputies` | 已登录 | 当前执行版代班记录（含已撤销历史）；舞监另返回可选岗位 `positions` 与执行账号 `operators` |
 | POST | `/api/live/deputies` | 舞监 | 启用岗位代班（仅当前执行版）；重复启用 409 `DEPUTY_EXISTS`；同事务使失去登记权者的签认失效 |
 | POST | `/api/live/deputies/revoke` | 舞监 | 撤销岗位在任代班；无在任代班 409 `NO_ACTIVE_DEPUTY`；同事务使失去登记权者的签认失效 |
@@ -306,11 +325,11 @@ SESSION_SECRET=your-long-random-secret
 | POST | `/api/registrations/corrections` | 舞监 | 更正/清除单个登记字段（校验行版本号、仅当前执行版本；级联清除与一致性校验；原子写入更正历史；已跳过项 409 `CUE_SKIPPED`；**更正后的实际时刻落入任一段停排区间 400 `INTERRUPTION_TIME_CONFLICT`；停排期间仍可更正**） |
 | GET | `/api/live/skips/preview` | 舞监 | **依赖链跳过影响预览**（仅当前执行版）：根项及沿前置可达的全部后继、各项行版本、阻断项与已跳过原因 |
 | POST | `/api/live/skips` | 舞监 | **确认跳过整条依赖链**（非空原因 + 预览所见行版本；事务内核验，阻断/版本变化整体拒绝；首跳清除预计结束并留痕，已跳过项不重复留痕） |
-| POST | `/api/live/whatif` | 舞监 | **现场顺延预演**（仅当前执行版，只读）：携带 `versionId`、全部登记行 `rows[]` 与一项或多项假设 `assumptions[]`；同一快照同时套用全部假设重算，返回逐项待执行开始/结束差异与新增/消失/仍存在的同岗位冲突；版本或任一行变化整体 409 `WHATIF_STALE`，无效假设 400 `WHATIF_INVALID`，不写入任何数据 |
+| POST | `/api/live/whatif` | 舞监 | **现场顺延预演**（仅当前执行版，只读）：携带 `versionId`、全部登记行 `rows[]` 与一项或多项假设 `assumptions[]`；同一快照同时套用全部假设重算，返回逐项待执行开始/结束差异与新增/消失/仍存在的同岗位冲突；版本或任一行变化整体 409 `WHATIF_STALE`，无效假设 400 `WHATIF_INVALID`，不写入任何数据；**另返回共享资源超额的 `resourceAlertsAdded/Removed/Kept`（口径与现场一致：跳过项不占用、仅已完成项不告警）及冻结资源 `resources`** |
 | GET | `/api/live/interruptions` | 已登录 | **联排中断记录**（当前执行版）：全部停排段（留痕，最新在前）与 `activeInterruption`（进行中或 null） |
 | POST | `/api/live/interruptions` | 舞监 | **停排**（仅当前执行版）：`{versionId, pauseText:"HH:MM", reason}`；同版已有进行中停排 409 `INTERRUPTION_EXISTS`；时刻不递增/覆盖已登记实际时刻 400；停排事务内清除未开始项预计结束（行版本+1、留痕）、有效双签整体失效 |
 | POST | `/api/live/interruptions/resume` | 舞监 | **恢复**（仅当前执行版）：`{versionId, resumeText:"HH:MM"}`；无进行中停排 409 `NO_ACTIVE_INTERRUPTION`；时刻不晚于停排/覆盖实际时刻 400；恢复后按中断顺延规则重算（实际登记时间不变） |
-| GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表（含 `skipCount`、**`interruptionCount` / `interruptionActive`、`reviewSealed` / `reviewSealedAt` 复盘封存标记**）与历史回看（每行含更正历史 `corrections`、跳过留痕 `skip`、放行签认 `release` 与**中断影响标注**，**版本含 `interruptions` 停排记录与 `activeInterruption`**，含全部签认记录 `release.records` 及失效原因，只读） |
+| GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表（含 `skipCount`、**`interruptionCount` / `interruptionActive`、`reviewSealed` / `reviewSealedAt` 复盘封存标记**）与历史回看（每行含更正历史 `corrections`、跳过留痕 `skip`、放行签认 `release` 与**中断影响标注**，**版本含冻结共享资源 `resources`、每行占用 `cues[].resources` 与只读重算的 `resourceAlerts`**，**版本含 `interruptions` 停排记录与 `activeInterruption`**，含全部签认记录 `release.records` 及失效原因，只读） |
 | GET | `/api/versions/:id/cues/:cueRef/explain` | 已登录 | **排期开始来源解释**（当前执行版与历史版本通用，只读）：以原计划开始为基线，达到最终最大约束时刻的直接前置全部列出并逐层追溯来源；目标已开始/已完成/已跳过返回明确说明 |
 | GET | `/api/live/review` | 舞监 | **当前执行版复盘实时预览**：逐项状态（本版完成 / 交接自旧版完成 / 进行中 / 未开始 / 已跳过）、开始有符号偏差、实际持续分钟、停排扣除分钟、净执行分钟，及按岗位汇总与封存依据 `basis`；无版本 409 `NO_LIVE_VERSION` |
 | POST | `/api/live/review/seal` | 舞监 | **封存当前执行版复盘**：`{versionId, note?, basis}`（basis 取自预览，含全部登记行版本与停排状态）；任一依据变化 409 `REVIEW_BASIS_STALE` 整体拒绝，归档版 409 `REVIEW_VERSION_STALE`，每版重复封存 409 `REVIEW_ALREADY_SEALED`；明细与汇总作为不可改写快照保存 |
@@ -1283,3 +1302,108 @@ curl -b sm.cookie -s http://localhost:3000/api/versions/1/review
 
 - 未封存的版本 `snapshot` 为 `null`；封存后即便舞监继续更正该版登记，`snapshot.detail / summary` 仍保持封存时刻内容，`live` 显示最新实时明细；
 - 版本列表 `GET /api/versions` 每项带 `reviewSealed`（布尔）与 `reviewSealedAt`。
+
+## 十六、联排共享资源 API 调用示例（本轮新增）
+
+以本地默认端口 3000、舞监账号为例（`curl -c/-b` 复用会话 Cookie）。
+
+### 1. 在草稿中配置资源并为提示项填写占用量
+
+```bash
+# 登录
+curl -c sm.cookie -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' -d '{"username":"sm","password":"sm12345"}'
+
+# 新增共享资源（名称 + 正整数容量；校验草稿版本号）
+curl -b sm.cookie -s -X POST http://localhost:3000/api/draft/resources \
+  -H 'Content-Type: application/json' \
+  -d '{"version":0,"name":"升降台","capacity":1}'
+
+# 改名 / 调整容量（随发布冻结；不影响旧版）
+curl -b sm.cookie -s -X PUT http://localhost:3000/api/draft/resources/1 \
+  -H 'Content-Type: application/json' \
+  -d '{"version":1,"name":"主升降台","capacity":2}'
+
+# 编辑提示项时携带 resources（留空数量表示不占用；未传 resources 字段则保留原占用）
+curl -b sm.cookie -s -X PUT http://localhost:3000/api/draft/cues/1 \
+  -H 'Content-Type: application/json' -d '{
+    "version": 2, "rowVersion": 1,
+    "code": "L1", "title": "开场灯光就位", "position": "灯光",
+    "plannedStartText": "19:00", "duration": 5,
+    "resources": [ { "id": 1, "quantity": 1 } ]
+  }'
+```
+
+`GET /api/draft` 顶层含 `resources`，每个提示项含 `resources: [{resourceId, resourceName, quantity}]`，校验结果中资源超额为 `RESOURCE_OVERUSE`：
+
+```json
+{ "type": "RESOURCE_OVERUSE", "codes": ["L1", "S1"],
+  "message": "共享资源「升降台」在 19:03-19:05 超额：占用 2 > 容量 1（超 1）；相关提示项：「L1」占 1、「S1」占 1",
+  "resourceAlerts": [
+    { "resourceId": 1, "resourceName": "升降台", "capacity": 1, "usage": 2, "over": 1,
+      "startText": "19:03", "endText": "19:05",
+      "cues": [ {"cueRef": 1, "code": "L1", "quantity": 1, "status": null},
+                {"cueRef": 2, "code": "S1", "quantity": 1, "status": null} ] } ] }
+```
+
+### 2. 引用保护与发布冻结
+
+```bash
+# 仍被提示项引用的资源不能删除（逐项给出引用提示项与占用量）
+curl -b sm.cookie -s -X DELETE "http://localhost:3000/api/draft/resources/1?version=3"
+# HTTP 409
+# {"error":"RESOURCE_IN_USE",
+#  "message":"共享资源「升降台」仍被 2 个提示项引用，不能删除；请先清除这些提示项的占用量",
+#  "items":[{"cueId":1,"code":"L1","quantity":1,"reason":"「L1」仍占用 1"}, ...]}
+
+# 草稿存在资源超额时发布被阻止（与其他计划冲突合并为 422 PUBLISH_CONFLICT）
+curl -b sm.cookie -s -X POST http://localhost:3000/api/publish \
+  -H 'Content-Type: application/json' -d '{"version":3,"note":"首版"}'
+# HTTP 422 {"error":"PUBLISH_CONFLICT","errors":[ ..., {"type":"RESOURCE_OVERUSE", ...} ]}
+```
+
+发布成功后版本负载含冻结资源，现场按实际/预计/顺延重算超额：
+
+```json
+{
+  "id": 1, "versionNo": 1,
+  "resources": [ {"id": 1, "name": "升降台", "capacity": 1} ],
+  "resourceAlerts": [
+    { "resourceId": 1, "resourceName": "升降台", "capacity": 1, "usage": 2, "over": 1,
+      "startText": "19:12", "endText": "19:13",
+      "cues": [ {"cueRef": 4, "code": "L2", "quantity": 1, "status": "RUNNING"},
+                {"cueRef": 5, "code": "S2", "quantity": 1, "status": "PENDING"} ],
+      "message": "共享资源「升降台」在 19:12-19:13 超额：占用 2 > 容量 1（超 1）；相关提示项：「L2」占 1、「S2」占 1" } ]
+}
+```
+
+- **跳过项不占用**：S2 被标记跳过后，与 L2 重叠时段不再产生告警；
+- **仅有已完成项的超额不告警**：重叠时段内 L2、S2 都已完成后告警消失；
+- **告警不阻止登记**：出现超额时岗位的开始 / 预计结束 / 完成仍正常提交，仅蓝色横幅提示；
+- 发布后再改草稿资源（改名、容量、占用），`GET /api/versions/1` 仍显示冻结值；没有资源数据的旧版 `resources` 为 `[]`、`resourceAlerts` 为 `[]`，行为与升级前完全一致。
+
+### 3. 顺延预演中的资源告警对照
+
+`POST /api/live/whatif` 的响应在同岗位冲突之外另含共享资源部分，稳定键为「资源 + 半开时段 + 占用提示项集合」：
+
+```json
+{
+  "summary": {
+    "baselineResourceAlertCount": 0,
+    "scenarioResourceAlertCount": 1,
+    "resourceAddedCount": 1, "resourceRemovedCount": 0, "resourceKeptCount": 0
+  },
+  "resources": [ {"id": 1, "name": "无线话筒", "capacity": 1} ],
+  "resourceAlertsAdded": [
+    { "resourceName": "无线话筒", "startText": "19:12", "endText": "19:15",
+      "capacity": 1, "usage": 2, "over": 1,
+      "cues": [ {"cueRef": 4, "code": "L2", "quantity": 1, "status": "RUNNING"},
+                {"cueRef": 5, "code": "S2", "quantity": 1, "status": "PENDING"} ],
+      "message": "共享资源「无线话筒」在 19:12-19:15 超额：占用 2 > 容量 1（超 1）；相关提示项：「L2」占 1、「S2」占 1" }
+  ],
+  "resourceAlertsRemoved": [],
+  "resourceAlertsKept": []
+}
+```
+
+前端结果弹窗按 🔴 新增 / 🟢 消失 / 🟠 持续 分组展示（持续项时段变化时同时给出变更前后消息），口径与现场一致：跳过项不占用、仅已完成项的超额不告警。

@@ -229,11 +229,61 @@ function renderValidation(v) {
   }
 }
 
+function cueResourceTags(list) {
+  if (!list?.length) return '<span class="muted">—</span>';
+  return list.map((u) =>
+    `<span class="res-tag" title="共享资源占用量">${esc(u.resourceName)} ×${u.quantity}</span>`).join(' ');
+}
+
+// 提示项表单内的共享资源占用输入：每个资源一个正整数输入（留空=不占用）
+function renderCueResourceInputs(d, preservedValues) {
+  const box = $('#cue-resources-box');
+  if (!box) return;
+  if (!d.resources?.length) {
+    box.innerHTML = '<div class="muted">尚未配置共享资源；可在上方「联排共享资源」面板新增。</div>';
+    return;
+  }
+  box.innerHTML = `<div class="cue-resources-title">共享资源占用量（正整数，留空表示不占用）</div>
+    <div class="cue-resources-grid">${d.resources.map((r) => {
+      const v = preservedValues?.get(r.id) ?? '';
+      return `<label>${esc(r.name)}（容量 ${r.capacity}）
+        <input type="number" min="1" step="1" data-res-id="${r.id}" class="cue-res-input" value="${esc(v)}" placeholder="留空" /></label>`;
+    }).join('')}</div>`;
+}
+
+// 草稿共享资源列表（名称 / 容量 / 被引用提示项 / 编辑删除）
+function renderDraftResources() {
+  const tbody = $('#draft-resource-tbody');
+  if (!tbody) return;
+  const d = state.draft;
+  const refByRes = new Map((d.resources || []).map((r) => [r.id, []]));
+  for (const c of d.cues) {
+    for (const u of c.resources || []) {
+      if (refByRes.has(u.resourceId)) refByRes.get(u.resourceId).push({ code: c.code, quantity: u.quantity });
+    }
+  }
+  tbody.innerHTML = (d.resources || []).map((r) => {
+    const refs = refByRes.get(r.id) || [];
+    return `<tr>
+      <td><strong>${esc(r.name)}</strong></td>
+      <td class="mono">${r.capacity}</td>
+      <td>${refs.length
+        ? refs.map((x) => `<span class="res-tag">${esc(x.code)} ×${x.quantity}</span>`).join(' ')
+        : '<span class="muted">未被引用</span>'}</td>
+      <td>
+        <button class="ghost tiny" data-act="edit-resource" data-id="${r.id}">编辑</button>
+        <button class="danger tiny" data-act="del-resource" data-id="${r.id}" data-name="${esc(r.name)}" ${refs.length ? 'disabled title="仍被提示项引用，不能删除"' : ''}>删除</button>
+      </td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="4" class="muted">暂无共享资源；新增后可在提示项表单中填写占用量。</td></tr>';
+}
+
 function renderDraft() {
   const d = state.draft;
   if (!d) return;
   $('#draft-ver').textContent = `（草稿版本号 v${d.version}）`;
   renderValidation(d.validation);
+  renderDraftResources();
 
   const posSelect = $('#cue-position-select');
   posSelect.innerHTML = '<option value="">选择岗位</option>' +
@@ -260,13 +310,14 @@ function renderDraft() {
       <td class="mono">${c.duration} 分</td>
       <td class="mono">${minText(end)}</td>
       <td>${c.needsRelease ? '<span class="release-tag">需放行</span>' : '<span class="muted">—</span>'}</td>
+      <td>${cueResourceTags(c.resources)}</td>
       <td>${preds}</td>
       <td>
         <button class="ghost tiny" data-act="edit-cue" data-id="${c.id}">编辑</button>
         <button class="ghost tiny" data-act="del-cue" data-id="${c.id}" data-code="${esc(c.code)}">删除</button>
       </td>
     </tr>`;
-  }).join('') || `<tr><td colspan="9" class="muted">暂无提示项，请在左侧新增。</td></tr>`;
+  }).join('') || `<tr><td colspan="10" class="muted">暂无提示项，请在左侧新增。</td></tr>`;
 
   $('#dep-list').innerHTML = d.deps.map((dep) => {
     const a = cueMap.get(dep.from), b = cueMap.get(dep.to);
@@ -275,6 +326,15 @@ function renderDraft() {
       <button class="ghost tiny" data-act="del-dep" data-id="${dep.id}">移除</button>
     </div>`;
   }).join('') || '<div class="muted">暂无前置关系。</div>';
+
+  // 草稿重渲染后恢复资源占用输入：编辑中取该提示项的已存占用，否则保留用户刚填的值
+  const preserved = new Map();
+  $$('.cue-res-input').forEach((inp) => preserved.set(Number(inp.dataset.resId), inp.value));
+  if (state.editingCueId) {
+    const ec = d.cues.find((c) => c.id === state.editingCueId);
+    for (const u of ec?.resources || []) preserved.set(u.resourceId, String(u.quantity));
+  }
+  renderCueResourceInputs(d, preserved);
 
   $('#publish-result').innerHTML = '';
 }
@@ -294,6 +354,7 @@ function resetCueForm() {
   $('#cue-submit').textContent = '新增';
   $('#cue-cancel').hidden = true;
   state.editingCueId = null;
+  renderCueResourceInputs(state.draft, new Map());
 }
 
 $('#cue-cancel').addEventListener('click', resetCueForm);
@@ -310,6 +371,11 @@ $('#cue-form').addEventListener('submit', async (ev) => {
     plannedStartText: fd.get('plannedStartText'),
     duration: Number(fd.get('duration')),
     needsRelease: f.elements.needsRelease.checked,
+    // 共享资源占用：每个资源一项（留空数量不提交）；无效正整数由服务端整体拒绝
+    resources: $$('.cue-res-input', f).map((inp) => ({
+      id: Number(inp.dataset.resId),
+      quantity: inp.value.trim() === '' ? '' : Number(inp.value),
+    })),
   };
   const id = fd.get('id');
   try {
@@ -345,6 +411,8 @@ $('#draft-cue-tbody').addEventListener('click', async (ev) => {
     f.elements.plannedStartText.value = c.plannedStartText;
     f.elements.duration.value = c.duration;
     f.elements.needsRelease.checked = !!c.needsRelease;
+    const preset = new Map((c.resources || []).map((u) => [u.resourceId, String(u.quantity)]));
+    renderCueResourceInputs(state.draft, preset);
     $('#cue-form-title').textContent = `编辑提示项 ${c.code}`;
     $('#cue-submit').textContent = '保存修改';
     $('#cue-cancel').hidden = false;
@@ -397,6 +465,73 @@ function selectedHandoverItems() {
   return (state.handover?.eligible || []).filter((it) => it.selected)
     .map((it) => ({ cueRef: it.cueRef, rowVersion: it.rowVersion }));
 }
+
+// ---------- 舞监：联排共享资源（草稿配置） ----------
+
+function resetResourceForm() {
+  const f = $('#resource-form');
+  f.reset();
+  f.elements.id.value = '';
+  $('#resource-submit').textContent = '新增资源';
+  $('#resource-cancel').hidden = true;
+}
+
+$('#resource-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  if (!state.draft) return;
+  const f = ev.target;
+  const id = f.elements.id.value;
+  const payload = {
+    version: state.draft.version,
+    name: f.elements.name.value.trim(),
+    capacity: Number(f.elements.capacity.value),
+  };
+  try {
+    if (id) {
+      state.draft = await api('PUT', `/api/draft/resources/${id}`, payload);
+      alertBar('ok', '共享资源已更新（名称/容量随发布冻结），草稿版本号 v' + state.draft.version);
+    } else {
+      state.draft = await api('POST', '/api/draft/resources', payload);
+      alertBar('ok', '共享资源已新增，草稿版本号 v' + state.draft.version);
+    }
+    resetResourceForm();
+    renderDraft();
+  } catch (e) {
+    alertBar('error', errorToHtml(e));
+    if (e.status === 409) loadDraft().then(renderDraft).catch(() => {});
+  }
+});
+
+$('#resource-cancel').addEventListener('click', resetResourceForm);
+
+$('#draft-resource-tbody').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-act]');
+  if (!btn) return;
+  const act = btn.dataset.act;
+  const rid = Number(btn.dataset.id);
+  const r = (state.draft.resources || []).find((x) => x.id === rid);
+  if (act === 'edit-resource') {
+    if (!r) return;
+    const f = $('#resource-form');
+    f.elements.id.value = r.id;
+    f.elements.name.value = r.name;
+    f.elements.capacity.value = r.capacity;
+    $('#resource-submit').textContent = '保存修改';
+    $('#resource-cancel').hidden = false;
+  } else if (act === 'del-resource') {
+    if (!r) return;
+    if (!confirm(`确认删除共享资源「${btn.dataset.name}」？`)) return;
+    try {
+      state.draft = await api('DELETE', `/api/draft/resources/${rid}?version=${state.draft.version}`);
+      alertBar('ok', '共享资源已删除，草稿版本号 v' + state.draft.version);
+      resetResourceForm();
+      renderDraft();
+    } catch (e) {
+      alertBar('error', errorToHtml(e), 9000);
+      if (e.status === 409) loadDraft().then(renderDraft).catch(() => {});
+    }
+  }
+});
 
 $('#handover-reload').addEventListener('click', () =>
   loadHandover().then(() => alertBar('ok', '交接预览已刷新')).catch((e) => alertBar('error', errorToHtml(e))));
@@ -662,17 +797,53 @@ function renderConflicts(conflicts) {
   }</ul></div>`;
 }
 
+// 共享资源超额告警横幅（口径与现场重算一致：跳过项不占用；仅已完成项的超额不告警；告警不阻止登记）
+function renderResourceAlerts(v) {
+  const box = $('#live-resource-alerts');
+  const alerts = v?.resourceAlerts || [];
+  if (!alerts.length) { box.innerHTML = ''; return; }
+  box.innerHTML = `<div class="resource-banner"><strong>🧰 共享资源超额 ${alerts.length} 项（按实际 / 预计 / 顺延后时段重算，仅提示，不阻止登记）：</strong><ul>${
+    alerts.map((a) => {
+      const cueText = a.cues.map((c) => {
+        const st = c.status === 'DONE' ? '<span class="res-cue-done">已完成</span>'
+          : c.status === 'RUNNING' ? '<span class="res-cue-running">进行中</span>'
+          : c.status === 'PENDING' ? '<span class="res-cue-pending">未开始</span>' : '';
+        return `「${esc(c.code)}」占 ${c.quantity}${st ? ' ' + st : ''}`;
+      }).join('、');
+      return `<li>资源「<strong>${esc(a.resourceName)}</strong>」<span class="mono">${esc(a.startText)}-${esc(a.endText)}</span>：
+        占用 ${a.usage} &gt; 容量 ${a.capacity}（超 ${a.over}）｜${cueText}</li>`;
+    }).join('')
+  }</ul></div>`;
+}
+
+// 本版冻结的共享资源清单（只读；旧版无资源数据时不显示面板）
+function renderLiveResources(v) {
+  const panel = $('#live-resources-panel');
+  if (!panel) return;
+  const list = v?.resources || [];
+  panel.hidden = list.length === 0;
+  if (!list.length) return;
+  $('#live-resources-body').innerHTML = `
+    <div class="table-wrap"><table>
+      <thead><tr><th>资源名称</th><th>容量（冻结）</th></tr></thead>
+      <tbody>${list.map((r) => `<tr><td><strong>${esc(r.name)}</strong></td><td class="mono">${r.capacity}</td></tr>`).join('')}</tbody>
+    </table></div>
+    <div class="muted">容量与各提示项占用量随第 ${v.versionNo} 版发布冻结；草稿后续修改不影响本版。超额告警按现场实际 / 预计 / 顺延后的执行时段重算：跳过项不占用，仅已完成项的超额不告警。</div>`;
+}
+
 function renderLive() {
   const v = state.live;
   if (!v) {
     $('#live-meta').innerHTML = '<div class="muted">尚未发布任何联排版本，请等待舞监发布。</div>';
     $('#live-conflicts').innerHTML = '';
+    $('#live-resource-alerts').innerHTML = '';
     $('#live-interruption-banner').innerHTML = '';
     $('#live-deputy-banner').innerHTML = '';
     $('#deputy-panel').hidden = true;
     $('#interruption-panel').hidden = true;
     $('#whatif-panel').hidden = true;
     $('#review-panel').hidden = true;
+    $('#live-resources-panel').hidden = true;
     $('#live-tbody').innerHTML = '';
     return;
   }
@@ -680,6 +851,8 @@ function renderLive() {
     `<strong>第 ${v.versionNo} 版</strong>　${esc(v.note)}　<span class="muted">发布于 ${esc(v.createdAt)}</span>
      ${v.isLatest ? '<span class="latest-tag">当前执行版本</span>' : '<span class="latest-tag" style="background:#999">非最新版本</span>'}`;
   renderConflicts(v.conflicts);
+  renderResourceAlerts(v);
+  renderLiveResources(v);
   renderInterruptionBanner(v);
   renderInterruptionPanel(v);
   renderDeputyBanner(v);
@@ -729,6 +902,7 @@ function renderLive() {
       <td><strong>${esc(c.code)}</strong>${c.release?.required ? '<div class="release-tag">需放行</div>' : ''}</td>
       <td>${esc(c.title)}</td>
       <td>${esc(c.position)}${deputyPosTag(activeDepByPos.get(c.position))}</td>
+      <td>${cueResourceTags(c.resources)}</td>
       <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
       <td class="mono">${skipped ? '—' : `${c.schedStartText}${delayed}${pauseHoldTag(c)}`}<div>${explainBtn(c, 'live')}</div></td>
       <td class="mono">${skipped ? '—' : `${c.schedEndText}${pauseShiftTag(c)}`}</td>
@@ -1364,7 +1538,9 @@ function renderWhatIfResult(data) {
       第 ${data.versionNo} 版（当前执行版）｜快照读取于 ${esc(data.readAt)}｜只读预演，未写入任何数据<br>
       本次假设 ${s.assumedCount} 项；逐项时段变化 ${s.changedCount} 项；
       同岗位冲突：基线 ${s.baselineConflictCount} 项 → 预演 ${s.scenarioConflictCount} 项
-      （新增 ${s.addedCount}、消失 ${s.removedCount}、仍存在 ${s.keptCount}）
+      （新增 ${s.addedCount}、消失 ${s.removedCount}、仍存在 ${s.keptCount}）<br>
+      共享资源超额：基线 ${s.baselineResourceAlertCount ?? 0} 项 → 预演 ${s.scenarioResourceAlertCount ?? 0} 项
+      （新增 ${s.resourceAddedCount ?? 0}、消失 ${s.resourceRemovedCount ?? 0}、持续 ${s.resourceKeptCount ?? 0}；口径与现场一致）
     </div>
     <div class="wi-assumptions">套用假设：${data.assumptions.map((a) =>
       `<span class="wi-assumed-tag">${esc(a.code)} ≤ <strong class="mono">${esc(a.estimatedEndText)}</strong></span>`).join(' ')}</div>`;
@@ -1383,6 +1559,21 @@ function renderWhatIfResult(data) {
     : '';
   const noConflict = (!s.addedCount && !s.removedCount && !s.keptCount)
     ? '<div class="val-ok">✅ 预演前后均无同岗位冲突。</div>' : '';
+
+  const resAdded = data.resourceAlertsAdded?.length
+    ? `<div class="resource-banner"><strong>🔴 新增共享资源超额 ${data.resourceAlertsAdded.length} 项：</strong><ul>${
+        data.resourceAlertsAdded.map((a) => `<li>${esc(a.message)}</li>`).join('')}</ul></div>` : '';
+  const resRemoved = data.resourceAlertsRemoved?.length
+    ? `<div class="wi-removed-box"><strong>🟢 消失的资源超额 ${data.resourceAlertsRemoved.length} 项：</strong><ul>${
+        data.resourceAlertsRemoved.map((a) => `<li>${esc(a.message)}</li>`).join('')}</ul></div>` : '';
+  const resKept = data.resourceAlertsKept?.length
+    ? `<div class="wi-kept-box"><strong>🟠 持续的资源超额 ${data.resourceAlertsKept.length} 项：</strong><ul>${
+        data.resourceAlertsKept.map((k) => k.baseline.message === k.scenario.message
+          ? `<li>${esc(k.scenario.message)}</li>`
+          : `<li>变更前：${esc(k.baseline.message)}<br>变更后：${esc(k.scenario.message)}</li>`).join('')}</ul></div>`
+    : '';
+  const noResAlert = (!(s.resourceAddedCount ?? 0) && !(s.resourceRemovedCount ?? 0) && !(s.resourceKeptCount ?? 0))
+    ? '<div class="val-ok">✅ 预演前后均无共享资源超额。</div>' : '';
 
   const trs = data.cues.map((c) => {
     const skipped = c.status === 'SKIPPED';
@@ -1406,6 +1597,7 @@ function renderWhatIfResult(data) {
   openModal(`现场顺延预演结果：第 ${data.versionNo} 版`, `
     ${head}
     ${added}${removed}${kept}${noConflict || ''}
+    ${resAdded}${resRemoved}${resKept}${noResAlert}
     <div class="table-wrap whatif-result-wrap">
       <table>
         <thead><tr>
@@ -1888,6 +2080,17 @@ function renderDetail() {
             <td class="mono">${it.active ? '—' : `${esc(it.resumedBy)}<br>${esc(it.resumedAt)}`}</td>
           </tr>`).join('')}</tbody>
         </table></div></div>` : '';
+  // 旧版共享资源冻结快照只读可查（旧版没有资源数据时不展示）
+  const resourceHtml = (v.resources || []).length
+    ? `<div class="panel"><h3>共享资源（发布冻结 · 只读）</h3>
+        <div class="table-wrap"><table>
+          <thead><tr><th>资源名称</th><th>容量</th></tr></thead>
+          <tbody>${v.resources.map((r) => `<tr><td><strong>${esc(r.name)}</strong></td><td class="mono">${r.capacity}</td></tr>`).join('')}</tbody>
+        </table></div></div>` : '';
+  // 旧版共享资源超额告警（按该版当前登记现场口径重算；仅提示）
+  const resourceAlertHtml = (v.resourceAlerts || []).length
+    ? `<div class="resource-banner"><strong>🧰 共享资源超额 ${v.resourceAlerts.length} 项（现场口径重算，仅提示）：</strong><ul>${
+        v.resourceAlerts.map((a) => `<li>${esc(a.message)}</li>`).join('')}</ul></div>` : '';
   $('#version-detail').innerHTML = `
     <div class="panel">
       <h3>回看：第 ${v.versionNo} 版（只读）${v.isLatest ? '<span class="latest-tag">当前执行版本</span>' : ''}</h3>
@@ -1895,10 +2098,12 @@ function renderDetail() {
     </div>
     ${v.activeInterruption ? `<div class="pause-banner">⛔ 该版本当前停排中（自 <strong class="mono">${esc(v.activeInterruption.pauseText)}</strong> 起，原因：${esc(v.activeInterruption.reason)}），登记 / 新签认 / 发布均被拒绝。</div>` : ''}
     ${conflictHtml}
+    ${resourceAlertHtml}
     ${interruptionHtml}
     ${deputyHtml}
+    ${resourceHtml}
     <div class="panel"><div class="table-wrap"><table>
-      <thead><tr><th>编号</th><th>说明</th><th>岗位</th><th>计划</th><th>重算开始</th><th>重算结束</th><th>状态</th><th>放行签认</th><th>实际开始</th><th>实际完成</th><th>预计结束</th><th>登记人/时间</th>${state.me?.role === 'sm' ? '<th>更正</th>' : ''}</tr></thead>
+      <thead><tr><th>编号</th><th>说明</th><th>岗位</th><th>共享资源</th><th>计划</th><th>重算开始</th><th>重算结束</th><th>状态</th><th>放行签认</th><th>实际开始</th><th>实际完成</th><th>预计结束</th><th>登记人/时间</th>${state.me?.role === 'sm' ? '<th>更正</th>' : ''}</tr></thead>
       <tbody>${v.cues.map((c) => {
         const skipped = c.status === 'SKIPPED';
         const skipViewBtn = state.me?.role === 'sm' && skipped
@@ -1907,6 +2112,7 @@ function renderDetail() {
         <td><strong>${esc(c.code)}</strong>${c.release?.required ? '<div class="release-tag">需放行</div>' : ''}</td>
         <td>${esc(c.title)}</td>
         <td>${esc(c.position)}</td>
+        <td>${cueResourceTags(c.resources)}</td>
         <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
         <td class="mono">${skipped ? '—' : `${c.schedStartText}${c.delayed ? '<div class="delayed">顺延</div>' : ''}${pauseHoldTag(c)}`}<div>${explainBtn(c, 'detail')}</div></td>
         <td class="mono">${skipped ? '—' : `${c.schedEndText}${pauseShiftTag(c)}`}</td>
